@@ -1,0 +1,334 @@
+
+// ===========================================
+//  UHI Analysis
+// Outputs: LST, NDVI, NDBI, UTFVI (6 classes), hotspot polygons, area stats
+
+// ===========================================
+var table = projects/ee-deepalibidwai/assets/UHI_AGU_poster/Riyadh_governate
+var point = ee.Geometry.Point([46.6632, 24.714]);
+var roiFeature = table.filterBounds(point).first(); 
+var roi = roiFeature.geometry().simplify(1000);
+
+//print(roi)
+
+Map.addLayer(roi, {color: 'red'}, 'ROI');
+Map.centerObject(roi, 8);
+
+// --------- USER PARAMETERS ----------
+var time_start = '2024-07-01';
+var time_end   = '2024-09-30';
+var maxCloudPct = 30;         // max cloud cover per scene
+var scale = 30;               // processing scale
+// ------------------------------------
+
+
+// 1) Cloud mask for Landsat 8 L2 using QA_PIXEL
+function maskL8sr(image) {
+  var qa = image.select('QA_PIXEL');
+  var cloudShadowBitMask = 1 << 3;
+  var cloudsBitMask = 1 << 5;
+  var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+             .and(qa.bitwiseAnd(cloudsBitMask).eq(0));
+  return image.updateMask(mask);
+}
+
+// 2) Load collection, filter, mask, and scale bands
+function applyScaleFactors(image) {
+  // Optical SR bands (SR_B1..SR_B7)
+  var optical = image.select(['SR_B1','SR_B2','SR_B3','SR_B4','SR_B5','SR_B6','SR_B7'])
+                     .multiply(0.0000275).add(-0.2);
+  // Thermal band (ST_B10) — brightness temperature in Kelvin
+  var thermal = image.select('ST_B10').multiply(0.00341802).add(149.0);
+  // Replace bands with scaled versions
+  return image.addBands(optical, null, true)
+              .addBands(thermal.rename('ST_B10'), null, true)
+              .copyProperties(image, image.propertyNames());
+}
+
+var collection = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+  .filterDate(time_start, time_end)
+  .filterBounds(roi)
+  .filter(ee.Filter.lt('CLOUD_COVER', maxCloudPct))
+  .map(maskL8sr)
+  .map(applyScaleFactors);
+
+// Check collection size
+print('Scenes found:', collection.size());
+
+// 3) Index / LST calculation per image
+function addIndices(image) {
+  var ndvi = image.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI');
+  var ndbi = image.normalizedDifference(['SR_B6', 'SR_B5']).rename('NDBI');
+  // ST_B10 currently in Kelvin (after applyScaleFactors)
+  var lstC = image.select('ST_B10').subtract(273.15).rename('LST'); // Celsius
+  return image.addBands([ndvi, ndbi, lstC]);
+}
+
+var collIndices = collection.map(addIndices);
+
+// 4) Create composites: median and mean
+var medianComposite = collIndices.median().clip(roi);
+var meanComposite   = collIndices.mean().clip(roi);
+
+// Visual check layers
+Map.addLayer(medianComposite.select(['SR_B4','SR_B3','SR_B2']), {min:0, max:0.3}, 'Median RGB');
+Map.addLayer(medianComposite.select('LST'), {min:20, max:45, palette:['blue','green','yellow','orange','red']}, 'Median LST (°C)');
+
+
+// 5) Compute city-level baseline temperature (mean LST across ROI)
+var meanLSTdict = meanComposite.select('LST').reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: roi,
+  scale: scale,
+  maxPixels: 1e10
+});
+var cityMeanLST = ee.Number(meanLSTdict.get('LST'));
+print('City mean LST (°C):', cityMeanLST);
+
+// 6) UTFVI calculation: (LST_pixel - LST_city_mean) / LST_city_mean
+// We'll compute UTFVI from the medianComposite LST to be robust to outliers
+var lstImage = medianComposite.select('LST');
+var utfvi = lstImage.subtract(cityMeanLST).divide(cityMeanLST).rename('UTFVI');
+
+// Add numeric UTFVI image to map
+Map.addLayer(utfvi, {min: -0.02, max: 0.08, palette: ['darkblue','blue','white','yellow','orange','red']}, 'UTFVI (raw)');
+
+
+// 7) UTFVI classification (6 classes) and palette
+// Define class breaks (you can adjust thresholds)
+var breaks = [-1, 0.0, 0.005, 0.02, 0.04, 0.06, 10]; // last bucket catches everything >0.06
+var classNames = [
+  'Cooler than mean',      // UTFVI < 0.0
+  'No/Very weak stress',   // 0 - 0.005
+  'Weak stress',           // 0.005 - 0.02
+  'Moderate stress',       // 0.02 - 0.04
+  'Strong stress',         // 0.04 - 0.06
+  'Extreme stress'         // > 0.06
+];
+var classPalette = ['#2c7bb6','#7fcdbb','#fed976','#feb24c','#f03b20','#99000d'];
+
+// Create classified image using chained remap logic
+var utfviClass = utfvi.expression(
+  // expression: returns 0..5 integer classes
+  'b(0) < t0 ? 0' + // cooler than mean
+  ': (b(0) < t1 ? 1' +
+  ': (b(0) < t2 ? 2' +
+  ': (b(0) < t3 ? 3' +
+  ': (b(0) < t4 ? 4 : 5))))',
+  {
+    't0': breaks[1],
+    't1': breaks[2],
+    't2': breaks[3],
+    't3': breaks[4],
+    't4': breaks[5]
+  }
+).rename('UTFVI_CLASS').clip(roi);
+
+// Map the classes with palette
+Map.addLayer(utfviClass, {min:0, max:5, palette: classPalette}, 'UTFVI Classes');
+
+
+// 8) Area calculation (km^2) per UTFVI class
+var pixelAreaKm2 = ee.Image.pixelArea().divide(1e6); // km^2 per pixel
+
+// Calculate area for each class by summing pixel areas where mask equals class index
+// Convert classNames (JS array) into an ee.List
+var classNamesList = ee.List(classNames);
+
+// Calculate area (km²) for each UTFVI class — FIXED VERSION
+var classAreas = ee.List.sequence(0, 5).map(function(cls){
+  cls = ee.Number(cls);
+
+  var mask = utfviClass.eq(cls);
+
+  var area = pixelAreaKm2.updateMask(mask).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: roi,
+    scale: scale,
+    maxPixels: 1e10
+  }).get('area');
+
+  return ee.Feature(null, {
+    'class_id': cls,
+    'class_name': classNamesList.get(cls),   // <-- FIXED lookup
+    'area_km2': ee.Algorithms.If(area, area, 0)
+  });
+});
+
+print('Area per UTFVI class (km^2):', classAreas);
+
+
+// 9) Hotspot extraction & polygons
+// Define hotspot threshold (severe): UTFVI > 0.05 (adjustable)
+var hotspotThresh = 0.05;
+var hotspotsMask = utfvi.gt(hotspotThresh).selfMask();
+
+// Add hotspots raster to map
+Map.addLayer(hotspotsMask, {palette:['red']}, 'Hotspots (UTFVI > ' + hotspotThresh + ')');
+
+// Convert to vectors (polygons)
+var hotspotsVectors = hotspotsMask.reduceToVectors({
+  geometry: roi,
+  scale: scale,
+  geometryType: 'polygon',
+  eightConnected: false,
+  labelProperty: 'hot',        // label each vector with value 1
+  maxPixels: 1e10
+});
+
+// Compute area property for each polygon (km2)
+hotspotsVectors = hotspotsVectors.map(function(f){
+  var geom = f.geometry();
+
+  // Use non-zero error tolerance to avoid geometry errors
+  var areaKm2 = ee.Number(
+    geom.area({'maxError': 1})   // ---- FIX HERE
+  ).divide(1e6);
+
+  return f.set({
+    'area_km2': areaKm2,
+    'threshold': hotspotThresh
+  });
+});
+
+print('Hotspot polygons:', hotspotsVectors.limit(10));
+
+// // Export hotspots vector to Drive (Shapefile or GeoJSON)
+// Export.table.toDrive({
+//   collection: hotspotsVectors,
+//   description: 'UTFVI_hotspots_polygons',
+//   fileFormat: 'SHP'
+// });
+
+// // 10) Export composite raster (LST, NDVI, NDBI, UTFVI) to Drive
+// var exportImage = medianComposite.select(['LST','NDVI','NDBI']).addBands(utfvi.rename('UTFVI'));
+// Export.image.toDrive({
+//   image: exportImage,
+//   description: 'UHI_Analysis_Median_LST_NDVI_NDBI_UTFVI',
+//   folder: 'EarthEngineExports',
+//   fileNamePrefix: 'UHI_Riyadh_median_2024_summer',
+//   region: roi,
+//   scale: scale,
+//   maxPixels: 1e10
+// });
+
+// 11) Charts: LST histogram and LST vs NDVI scatter
+var hist = ui.Chart.image.histogram({
+  image: medianComposite.select('LST'),
+  region: roi,
+  scale: scale,
+  minBucketWidth: 0.2
+}).setOptions({title: 'Histogram of Median LST (°C)', hAxis:{title:'LST (°C)'}});
+
+print(hist);
+
+var samples = medianComposite.select(['LST','NDVI']).sample({
+  region: roi,
+  scale: scale,
+  numPixels: 5000,
+  seed: 1,
+  geometries: false
+});
+
+var scatter = ui.Chart.feature.byFeature(samples, 'NDVI', 'LST')
+  .setChartType('ScatterChart')
+  .setOptions({
+    title: 'LST vs NDVI (sampled pixels)',
+    hAxis: {title: 'NDVI'},
+    vAxis: {title: 'LST (°C)'},
+    pointSize: 3,
+    trendlines: {0: {}} // show one trendline
+  });
+print(scatter);
+
+
+// 12) Legend UI for UTFVI classes
+function makeLegend(panelTitle, colors, names){
+  var legend = ui.Panel({style:{position:'bottom-right', padding:'8px 12px'}});
+  legend.add(ui.Label({value: panelTitle, style: {fontWeight:'bold', fontSize:'14px', margin: '0 0 6px 0'}}));
+  for (var i=0; i<colors.length; i++){
+    var row = ui.Panel({
+      widgets: [
+        ui.Label('', {backgroundColor: colors[i], padding: '12px', margin: '0 6px 0 0'}),
+        ui.Label(names[i], {margin: '0 0 6px 0'})
+      ],
+      layout: ui.Panel.Layout.Flow('horizontal')
+    });
+    legend.add(row);
+  }
+  return legend;
+}
+Map.add(makeLegend('UTFVI Classes', classPalette, classNames));
+
+// 13) Print summary stats: mean/median/std LST and total hotspot area
+var stats = medianComposite.select('LST').reduceRegion({
+  reducer: ee.Reducer.mean().combine(ee.Reducer.median(), '', true).combine(ee.Reducer.stdDev(), '', true),
+  geometry: roi,
+  scale: scale,
+  maxPixels: 1e10
+});
+print('LST stats (median composite):', stats);
+
+// Total hotspot area (km2)
+var totalHotspotArea = pixelAreaKm2.updateMask(hotspotsMask).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  scale: scale,
+  maxPixels: 1e10
+});
+print('Total hotspot area (km^2):', totalHotspotArea);
+
+
+/////////////////////////////////****************************/////////////////////////////////////////
+
+// -----------------------------
+// 1) TOP 20 HOTTEST ZONES (ranked by mean UTFVI)
+// -----------------------------
+
+// 1A) Filter tiny polygons (remove noise) - set minimum area threshold (km^2)
+var minAreaKm2 = 0.01; // adjust as needed (0.01 km2 = 10,000 m2)
+var hotspotsFiltered = hotspotsVectors.filter(ee.Filter.gte('area_km2', minAreaKm2));
+print('Hotspots after area filter (count):', hotspotsFiltered.size());
+
+// 1B) Compute mean UTFVI and mean LST for each polygon
+var hotspotsStats = hotspotsFiltered.map(function(f){
+  var geom = f.geometry();
+
+  var meanUtfvi = ee.Number(utfvi.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: geom,
+    scale: scale,
+    maxPixels: 1e10
+  }).get('UTFVI'));
+
+  var meanLst = ee.Number(lstImage.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: geom,
+    scale: scale,
+    maxPixels: 1e10
+  }).get('LST'));
+
+  // Fallback to 0 if null (safe)
+  meanUtfvi = ee.Number(ee.Algorithms.If(meanUtfvi, meanUtfvi, -9999));
+  meanLst  = ee.Number(ee.Algorithms.If(meanLst, meanLst, -9999));
+
+  return f.set({
+    'mean_UTFVI': meanUtfvi,
+    'mean_LST': meanLst
+  });
+});
+
+// 1C) Sort polygons by mean UTFVI descending and limit to top 20
+var top20 = hotspotsStats.sort('mean_UTFVI', false).limit(20);
+print('Top 20 hottest zones (by mean UTFVI):', top20);
+
+// 1D) Show on map: highlight top 20
+Map.addLayer(top20, {color: 'magenta'}, 'Top 20 Hotspots');
+
+// // 1E) Export top 20 table to Drive (CSV)
+// Export.table.toDrive({
+//   collection: top20,
+//   description: 'Top20_Hottest_Zones_UTFVI',
+//   fileFormat: 'CSV',
+//   selectors: ['class_id', 'class_name', 'area_km2', 'mean_UTFVI', 'mean_LST'] // pick fields to export
+// });

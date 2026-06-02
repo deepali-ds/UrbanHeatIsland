@@ -9,7 +9,7 @@ UHI = Mean Urban LST − Mean Rural LST
 
 The script also visualizes UHI maps and exports them as RGB images.
 
-📌 Key Features
+ Key Features
  1. Riyadh Governorate Boundary Extraction
 
 Selects the region of interest (ROI) using a provided geojson file
